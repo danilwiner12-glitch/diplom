@@ -18,6 +18,10 @@ public:
     double dy;
     double dz;
 
+    double invDx;
+    double invDy;
+    double invDz;
+
     YeeGrid3D(std::size_t nx_, std::size_t ny_, std::size_t nz_,
               double lx_, double ly_, double lz_)
         : nx(nx_),
@@ -28,7 +32,10 @@ public:
           lz(lz_),
           dx(0.0),
           dy(0.0),
-          dz(0.0)
+          dz(0.0),
+          invDx(0.0),
+          invDy(0.0),
+          invDz(0.0)
     {
         if (nx < 2 || ny < 2 || nz < 2) {
             throw std::runtime_error("Yee grid must have at least 2x2x2 cells");
@@ -40,6 +47,10 @@ public:
         dx = lx / static_cast<double>(nx);
         dy = ly / static_cast<double>(ny);
         dz = lz / static_cast<double>(nz);
+
+        invDx = 1.0 / dx;
+        invDy = 1.0 / dy;
+        invDz = 1.0 / dz;
     }
 
     inline constexpr std::size_t index(std::size_t i,

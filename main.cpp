@@ -2,6 +2,7 @@
 #include <iostream>
 #include "YeeGrid3D.hpp"
 #include "Field3D.hpp"
+#include "Solver3D.hpp"
 
 int main() {
     const double lx = 1.0;
@@ -65,6 +66,15 @@ int main() {
     std::cout << "Bz coordinate: x = " << grid.xBz(i)
               << ", y = " << grid.yBz(j)
               << ", z = " << grid.zBz(k) << "\n";
+
+    Solver3D solver(grid, field, dt);
+    solver.addParticle(0.5 * lx, 0.5 * ly, 0.5 * lz,
+                       0.0, 0.0, 0.0,
+                       -1.602176634e-19, 9.1093837015e-31);
+
+    solver.step();
+
+    std::cout << "Particles = " << solver.particles.size() << "\n";
 
     return 0;
 }
