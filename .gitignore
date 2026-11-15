@@ -1,0 +1,6 @@
+/build/
+/output/
+__pycache__/
+*.pyc
+*.h5
+FILES_FOR_CHAT.txt

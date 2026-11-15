@@ -4,9 +4,11 @@
 #include <cmath>
 #include <cstddef>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 #include "YeeGrid3D.hpp"
 #include "Field3D.hpp"
+#include "Geometry3D.hpp"
 
 struct Particle {
     double x;
@@ -19,15 +21,39 @@ struct Particle {
     double m;
 };
 
+enum class ParticleBoundaryCondition {
+    Absorb,
+    Reflect
+};
+
 class Solver3D {
 public:
     const YeeGrid3D& grid;
     Field3D& field;
+    Geometry3D geometry;
     double dt;
     std::vector<Particle> particles;
+    ParticleBoundaryCondition particleBoundaryCondition;
+    double time = 0.0;
+    std::size_t stepNumber = 0;
+    std::size_t absorbedParticleCount = 0;
+    double absorbedCharge = 0.0;
 
     Solver3D(const YeeGrid3D& grid_, Field3D& field_, double dt_)
-        : grid(grid_), field(field_), dt(dt_)
+        : Solver3D(grid_, field_, dt_, Geometry3D(),
+                   ParticleBoundaryCondition::Absorb)
+    {
+    }
+
+    Solver3D(const YeeGrid3D& grid_, Field3D& field_, double dt_,
+             Geometry3D geometry_,
+             ParticleBoundaryCondition particleBoundaryCondition_ =
+                 ParticleBoundaryCondition::Absorb)
+        : grid(grid_),
+          field(field_),
+          geometry(std::move(geometry_)),
+          dt(dt_),
+          particleBoundaryCondition(particleBoundaryCondition_)
     {
         if (dt <= 0.0) {
             throw std::runtime_error("Time step must be positive");
@@ -54,20 +80,23 @@ public:
 
     void step() {
         updateMagneticField();
-        std::vector<Position> oldPositions;
-        oldPositions.reserve(particles.size());
-        for (const Particle& particle : particles) {
-            oldPositions.push_back(Position{particle.x, particle.y, particle.z});
-        }
-        moveParticles();
-        depositParticles(oldPositions);
+        applyMagneticBoundaryConditions();
+        const std::vector<Trajectory> trajectories = moveParticles();
+        depositParticles(trajectories);
         updateElectricField();
-        applyFieldBoundaryConditions();
+        applyElectricBoundaryConditions();
+        time += dt;
+        ++stepNumber;
+    }
+
+    void initializeSources() {
+        depositParticles({});
     }
 
 private:
     static constexpr double c0 = 299792458.0;
     static constexpr double epsilon0 = 8.8541878128e-12;
+    static constexpr double mu0 = 1.25663706212e-6;
 
     struct Position {
         double x;
@@ -80,6 +109,19 @@ private:
         double oldValue;
         double delta;
     };
+
+    struct Trajectory {
+        Position oldPosition;
+        Position newPosition;
+        double charge;
+    };
+
+    struct SurfaceCharge {
+        Position position;
+        double charge;
+    };
+
+    std::vector<SurfaceCharge> surfaceCharges_;
 
     std::size_t flatIndex(std::size_t i, std::size_t j, std::size_t k,
                           std::size_t sx, std::size_t sy) const {
@@ -206,18 +248,32 @@ private:
     }
 
     void updateElectricField() {
-        const double c2dt = c0 * c0 * dt;
-        const double currentDt = dt / epsilon0;
-
         for (std::size_t k = 1; k < grid.nz; ++k) {
             for (std::size_t j = 1; j < grid.ny; ++j) {
                 for (std::size_t i = 0; i < grid.nx; ++i) {
                     const std::size_t id = grid.indexEx(i, j, k);
-                    const double dBzDy = (field.Bz[grid.indexBz(i, j, k)] -
-                                          field.Bz[grid.indexBz(i, j - 1, k)]) * grid.invDy;
-                    const double dByDz = (field.By[grid.indexBy(i, j, k)] -
-                                          field.By[grid.indexBy(i, j, k - 1)]) * grid.invDz;
-                    field.Ex[id] += c2dt * (dBzDy - dByDz) - currentDt * field.Jx[id];
+                    const double hzUpper =
+                        field.Bz[grid.indexBz(i, j, k)] *
+                        inversePermeabilityAt(grid.xBz(i), grid.yBz(j),
+                                              grid.zBz(k));
+                    const double hzLower =
+                        field.Bz[grid.indexBz(i, j - 1, k)] *
+                        inversePermeabilityAt(grid.xBz(i), grid.yBz(j - 1),
+                                              grid.zBz(k));
+                    const double hyUpper =
+                        field.By[grid.indexBy(i, j, k)] *
+                        inversePermeabilityAt(grid.xBy(i), grid.yBy(j),
+                                              grid.zBy(k));
+                    const double hyLower =
+                        field.By[grid.indexBy(i, j, k - 1)] *
+                        inversePermeabilityAt(grid.xBy(i), grid.yBy(j),
+                                              grid.zBy(k - 1));
+                    const double curlH = (hzUpper - hzLower) * grid.invDy -
+                                         (hyUpper - hyLower) * grid.invDz;
+                    advanceElectricComponent(
+                        field.Ex[id], field.Jx[id], curlH,
+                        geometry.materialAt(grid.xEx(i), grid.yEx(j),
+                                            grid.zEx(k)));
                 }
             }
         }
@@ -226,11 +282,28 @@ private:
             for (std::size_t j = 0; j < grid.ny; ++j) {
                 for (std::size_t i = 1; i < grid.nx; ++i) {
                     const std::size_t id = grid.indexEy(i, j, k);
-                    const double dBxDz = (field.Bx[grid.indexBx(i, j, k)] -
-                                          field.Bx[grid.indexBx(i, j, k - 1)]) * grid.invDz;
-                    const double dBzDx = (field.Bz[grid.indexBz(i, j, k)] -
-                                          field.Bz[grid.indexBz(i - 1, j, k)]) * grid.invDx;
-                    field.Ey[id] += c2dt * (dBxDz - dBzDx) - currentDt * field.Jy[id];
+                    const double hxUpper =
+                        field.Bx[grid.indexBx(i, j, k)] *
+                        inversePermeabilityAt(grid.xBx(i), grid.yBx(j),
+                                              grid.zBx(k));
+                    const double hxLower =
+                        field.Bx[grid.indexBx(i, j, k - 1)] *
+                        inversePermeabilityAt(grid.xBx(i), grid.yBx(j),
+                                              grid.zBx(k - 1));
+                    const double hzUpper =
+                        field.Bz[grid.indexBz(i, j, k)] *
+                        inversePermeabilityAt(grid.xBz(i), grid.yBz(j),
+                                              grid.zBz(k));
+                    const double hzLower =
+                        field.Bz[grid.indexBz(i - 1, j, k)] *
+                        inversePermeabilityAt(grid.xBz(i - 1), grid.yBz(j),
+                                              grid.zBz(k));
+                    const double curlH = (hxUpper - hxLower) * grid.invDz -
+                                         (hzUpper - hzLower) * grid.invDx;
+                    advanceElectricComponent(
+                        field.Ey[id], field.Jy[id], curlH,
+                        geometry.materialAt(grid.xEy(i), grid.yEy(j),
+                                            grid.zEy(k)));
                 }
             }
         }
@@ -239,18 +312,60 @@ private:
             for (std::size_t j = 1; j < grid.ny; ++j) {
                 for (std::size_t i = 1; i < grid.nx; ++i) {
                     const std::size_t id = grid.indexEz(i, j, k);
-                    const double dByDx = (field.By[grid.indexBy(i, j, k)] -
-                                          field.By[grid.indexBy(i - 1, j, k)]) * grid.invDx;
-                    const double dBxDy = (field.Bx[grid.indexBx(i, j, k)] -
-                                          field.Bx[grid.indexBx(i, j - 1, k)]) * grid.invDy;
-                    field.Ez[id] += c2dt * (dByDx - dBxDy) - currentDt * field.Jz[id];
+                    const double hyUpper =
+                        field.By[grid.indexBy(i, j, k)] *
+                        inversePermeabilityAt(grid.xBy(i), grid.yBy(j),
+                                              grid.zBy(k));
+                    const double hyLower =
+                        field.By[grid.indexBy(i - 1, j, k)] *
+                        inversePermeabilityAt(grid.xBy(i - 1), grid.yBy(j),
+                                              grid.zBy(k));
+                    const double hxUpper =
+                        field.Bx[grid.indexBx(i, j, k)] *
+                        inversePermeabilityAt(grid.xBx(i), grid.yBx(j),
+                                              grid.zBx(k));
+                    const double hxLower =
+                        field.Bx[grid.indexBx(i, j - 1, k)] *
+                        inversePermeabilityAt(grid.xBx(i), grid.yBx(j - 1),
+                                              grid.zBx(k));
+                    const double curlH = (hyUpper - hyLower) * grid.invDx -
+                                         (hxUpper - hxLower) * grid.invDy;
+                    advanceElectricComponent(
+                        field.Ez[id], field.Jz[id], curlH,
+                        geometry.materialAt(grid.xEz(i), grid.yEz(j),
+                                            grid.zEz(k)));
                 }
             }
         }
     }
 
-    void moveParticles() {
-        for (Particle& p : particles) {
+    double inversePermeabilityAt(double x, double y, double z) const {
+        return 1.0 /
+               (mu0 * geometry.materialAt(x, y, z).relativePermeability);
+    }
+
+    void advanceElectricComponent(double& electricField,
+                                  double currentDensity,
+                                  double curlH,
+                                  const Material& material) const {
+        const double permittivity =
+            epsilon0 * material.relativePermittivity;
+        const double damping =
+            0.5 * material.conductivity * dt / permittivity;
+        const double oldFieldFactor = (1.0 - damping) / (1.0 + damping);
+        const double sourceFactor = dt / (permittivity * (1.0 + damping));
+        electricField = oldFieldFactor * electricField +
+                        sourceFactor * (curlH - currentDensity);
+    }
+
+    std::vector<Trajectory> moveParticles() {
+        std::vector<Trajectory> trajectories;
+        trajectories.reserve(particles.size());
+        std::vector<Particle> survivingParticles;
+        survivingParticles.reserve(particles.size());
+
+        for (Particle p : particles) {
+            const Position oldPosition{p.x, p.y, p.z};
             const double ex = sample(field.Ex, grid.nx, grid.ny + 1, grid.nz + 1,
                                      0.5, 0.0, 0.0, p.x, p.y, p.z);
             const double ey = sample(field.Ey, grid.nx + 1, grid.ny, grid.nz + 1,
@@ -301,8 +416,31 @@ private:
             p.y += p.py * inverseRelativisticMass * dt;
             p.z += p.pz * inverseRelativisticMass * dt;
 
-            reflectParticle(p);
+            if (isInside(p.x, p.y, p.z)) {
+                trajectories.push_back(
+                    Trajectory{oldPosition, Position{p.x, p.y, p.z}, p.q});
+                survivingParticles.push_back(p);
+            } else if (particleBoundaryCondition ==
+                       ParticleBoundaryCondition::Reflect) {
+                reflectParticle(p);
+                trajectories.push_back(
+                    Trajectory{oldPosition, Position{p.x, p.y, p.z}, p.q});
+                survivingParticles.push_back(p);
+            } else {
+                const Position boundaryPosition =
+                    firstBoundaryIntersection(oldPosition,
+                                              Position{p.x, p.y, p.z});
+                trajectories.push_back(
+                    Trajectory{oldPosition, boundaryPosition, p.q});
+                surfaceCharges_.push_back(
+                    SurfaceCharge{boundaryPosition, p.q});
+                ++absorbedParticleCount;
+                absorbedCharge += p.q;
+            }
         }
+
+        particles = std::move(survivingParticles);
+        return trajectories;
     }
 
     double momentumGamma(double px, double py, double pz, double mass) const {
@@ -314,6 +452,54 @@ private:
         reflectCoordinate(p.x, p.px, grid.lx);
         reflectCoordinate(p.y, p.py, grid.ly);
         reflectCoordinate(p.z, p.pz, grid.lz);
+    }
+
+    bool isInside(double x, double y, double z) const noexcept {
+        return x >= 0.0 && x <= grid.lx &&
+               y >= 0.0 && y <= grid.ly &&
+               z >= 0.0 && z <= grid.lz;
+    }
+
+    Position firstBoundaryIntersection(const Position& oldPosition,
+                                       const Position& newPosition) const {
+        const double dx = newPosition.x - oldPosition.x;
+        const double dy = newPosition.y - oldPosition.y;
+        const double dz = newPosition.z - oldPosition.z;
+        double fraction = 1.0;
+
+        const auto includeIntersection = [&fraction](double oldCoordinate,
+                                                      double displacement,
+                                                      double boundary) {
+            if (displacement == 0.0) {
+                return;
+            }
+            const double candidate =
+                (boundary - oldCoordinate) / displacement;
+            if (candidate >= 0.0 && candidate < fraction) {
+                fraction = candidate;
+            }
+        };
+
+        if (newPosition.x < 0.0) {
+            includeIntersection(oldPosition.x, dx, 0.0);
+        } else if (newPosition.x > grid.lx) {
+            includeIntersection(oldPosition.x, dx, grid.lx);
+        }
+        if (newPosition.y < 0.0) {
+            includeIntersection(oldPosition.y, dy, 0.0);
+        } else if (newPosition.y > grid.ly) {
+            includeIntersection(oldPosition.y, dy, grid.ly);
+        }
+        if (newPosition.z < 0.0) {
+            includeIntersection(oldPosition.z, dz, 0.0);
+        } else if (newPosition.z > grid.lz) {
+            includeIntersection(oldPosition.z, dz, grid.lz);
+        }
+
+        return Position{
+            std::clamp(oldPosition.x + fraction * dx, 0.0, grid.lx),
+            std::clamp(oldPosition.y + fraction * dy, 0.0, grid.ly),
+            std::clamp(oldPosition.z + fraction * dz, 0.0, grid.lz)};
     }
 
     void reflectCoordinate(double& coordinate, double& momentum,
@@ -385,15 +571,12 @@ private:
         return weights;
     }
 
-    void depositCurrentX(const Particle& particle,
+    void depositCurrentX(double charge,
                          const std::vector<ShapeWeight1D>& xWeights,
                          const std::vector<ShapeWeight1D>& yWeights,
                          const std::vector<ShapeWeight1D>& zWeights,
                          double inverseVolume) {
-        // Esirkepov density decomposition for a product of first-order
-        // (Cloud-in-Cell) shape factors, followed by the discrete integral
-        // of W along the component direction.
-        const double scale = -particle.q * grid.dx * inverseVolume / dt;
+        const double scale = -charge * grid.dx * inverseVolume / dt;
         for (const ShapeWeight1D& y : yWeights) {
             for (const ShapeWeight1D& z : zWeights) {
                 const double transverseWeight =
@@ -413,12 +596,12 @@ private:
         }
     }
 
-    void depositCurrentY(const Particle& particle,
+    void depositCurrentY(double charge,
                          const std::vector<ShapeWeight1D>& xWeights,
                          const std::vector<ShapeWeight1D>& yWeights,
                          const std::vector<ShapeWeight1D>& zWeights,
                          double inverseVolume) {
-        const double scale = -particle.q * grid.dy * inverseVolume / dt;
+        const double scale = -charge * grid.dy * inverseVolume / dt;
         for (const ShapeWeight1D& x : xWeights) {
             for (const ShapeWeight1D& z : zWeights) {
                 const double transverseWeight =
@@ -438,12 +621,12 @@ private:
         }
     }
 
-    void depositCurrentZ(const Particle& particle,
+    void depositCurrentZ(double charge,
                          const std::vector<ShapeWeight1D>& xWeights,
                          const std::vector<ShapeWeight1D>& yWeights,
                          const std::vector<ShapeWeight1D>& zWeights,
                          double inverseVolume) {
-        const double scale = -particle.q * grid.dz * inverseVolume / dt;
+        const double scale = -charge * grid.dz * inverseVolume / dt;
         for (const ShapeWeight1D& x : xWeights) {
             for (const ShapeWeight1D& y : yWeights) {
                 const double transverseWeight =
@@ -463,36 +646,47 @@ private:
         }
     }
 
-    void depositParticles(const std::vector<Position>& oldPositions) {
-        if (oldPositions.size() != particles.size()) {
-            throw std::runtime_error("Old particle positions are inconsistent");
-        }
-
+    void depositParticles(const std::vector<Trajectory>& trajectories) {
         field.clearSources();
         const double invVolume = grid.invDx * grid.invDy * grid.invDz;
 
-        for (std::size_t particleIndex = 0;
-             particleIndex < particles.size(); ++particleIndex) {
-            const Particle& p = particles[particleIndex];
-            const Position& old = oldPositions[particleIndex];
-
+        for (const Particle& p : particles) {
             deposit(field.rho, grid.nx + 1, grid.ny + 1, grid.nz + 1,
                     0.0, 0.0, 0.0, p.x, p.y, p.z, p.q * invVolume);
+        }
+        for (const SurfaceCharge& surfaceCharge : surfaceCharges_) {
+            deposit(field.rho, grid.nx + 1, grid.ny + 1, grid.nz + 1,
+                    0.0, 0.0, 0.0,
+                    surfaceCharge.position.x,
+                    surfaceCharge.position.y,
+                    surfaceCharge.position.z,
+                    surfaceCharge.charge * invVolume);
+        }
 
-            const auto xWeights = shapeChange(old.x, p.x, grid.invDx,
+        for (const Trajectory& trajectory : trajectories) {
+            const auto xWeights = shapeChange(trajectory.oldPosition.x,
+                                              trajectory.newPosition.x,
+                                              grid.invDx,
                                               grid.nx + 1);
-            const auto yWeights = shapeChange(old.y, p.y, grid.invDy,
+            const auto yWeights = shapeChange(trajectory.oldPosition.y,
+                                              trajectory.newPosition.y,
+                                              grid.invDy,
                                               grid.ny + 1);
-            const auto zWeights = shapeChange(old.z, p.z, grid.invDz,
+            const auto zWeights = shapeChange(trajectory.oldPosition.z,
+                                              trajectory.newPosition.z,
+                                              grid.invDz,
                                               grid.nz + 1);
 
-            depositCurrentX(p, xWeights, yWeights, zWeights, invVolume);
-            depositCurrentY(p, xWeights, yWeights, zWeights, invVolume);
-            depositCurrentZ(p, xWeights, yWeights, zWeights, invVolume);
+            depositCurrentX(trajectory.charge, xWeights, yWeights, zWeights,
+                            invVolume);
+            depositCurrentY(trajectory.charge, xWeights, yWeights, zWeights,
+                            invVolume);
+            depositCurrentZ(trajectory.charge, xWeights, yWeights, zWeights,
+                            invVolume);
         }
     }
 
-    void applyFieldBoundaryConditions() {
+    void applyElectricBoundaryConditions() {
         for (std::size_t k = 0; k <= grid.nz; ++k) {
             for (std::size_t j = 0; j < grid.ny; ++j) {
                 field.Ey[grid.indexEy(0, j, k)] = 0.0;
@@ -531,7 +725,9 @@ private:
                 field.Ey[grid.indexEy(i, j, grid.nz)] = 0.0;
             }
         }
+    }
 
+    void applyMagneticBoundaryConditions() {
         for (std::size_t k = 0; k < grid.nz; ++k) {
             for (std::size_t j = 0; j < grid.ny; ++j) {
                 field.Bx[grid.indexBx(0, j, k)] = 0.0;
